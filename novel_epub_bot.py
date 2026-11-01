@@ -44,12 +44,13 @@ from urllib import error, parse, request
 # ============================== CONFIG ==============================
 BOT_TOKEN = ""  # Render par Environment Variable TELEGRAM_BOT_TOKEN me daalo (yahan mat likho)
 ALLOWED_USERS = {8049392574}  # Admin ID added
-WORKERS = int(os.environ.get("WORKERS", 24))  # Render free (0.1 CPU, 512MB) ke liye 24; zyada CPU ho to badhao
+WORKERS = int(os.environ.get("WORKERS", 32))  # ek job ke max parallel chapters
+TOTAL_WORKERS = int(os.environ.get("TOTAL_WORKERS", 64))  # sab jobs milake max threads (jobs badhne par har job ke workers khud kam hote hain)
 HOST_MAX = int(os.environ.get("HOST_MAX", 48))  # ek SITE par sab jobs milake max ek saath requests (alag site = alag limit)
 MIN_WORKERS = 4  # block aane par bhi kam se kam itne chalenge
-MAX_JOBS_PER_CHAT = 3  # ek chat me ek saath max EPUB jobs
-MAX_JOBS_TOTAL = 5  # poore bot me ek saath max jobs
-MAX_CHAPTERS = int(os.environ.get("MAX_CHAPTERS", 3000))  # 512MB RAM ke liye
+MAX_JOBS_PER_CHAT = int(os.environ.get("MAX_JOBS_PER_CHAT", 10))  # ek chat me ek saath max EPUB jobs
+MAX_JOBS_TOTAL = int(os.environ.get("MAX_JOBS_TOTAL", 12))  # poore bot me ek saath max jobs
+MAX_CHAPTERS = int(os.environ.get("MAX_CHAPTERS", 1500))  # 512MB RAM ke liye
 MAX_PAGE_BYTES = 8 * 1024 * 1024
 TIMEOUT = 15  # ek request ka timeout (sec)
 RETRIES = 3  # ek page ke liye network retries
@@ -660,6 +661,82 @@ def _num(text, href):
     return float(m[-1]) if m else None
 
 
+_A_RX = re.compile(r"<a\b([^>]*?)>(.*?)</a\s*>", re.I | re.S)
+_HREF_RX = re.compile(r"""\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.I)
+_TAG_RX = re.compile(r"<[^>]+>")
+_H1_RX = re.compile(r"<h1\b[^>]*>(.*?)</h1>", re.I | re.S)
+_TITLE_RX = re.compile(r"<title\b[^>]*>(.*?)</title>", re.I | re.S)
+_LANG_RX = re.compile(r"<html\b[^>]*?\blang\s*=\s*[\"']([\w-]+)", re.I)
+
+
+def _meta(text, key, val):
+    for rx in (r"<meta\b[^>]*?\b%s\s*=\s*[\"']%s[\"'][^>]*?\bcontent\s*=\s*[\"']([^\"']*)",
+               r"<meta\b[^>]*?\bcontent\s*=\s*[\"']([^\"']*)[\"'][^>]*?\b%s\s*=\s*[\"']%s[\"']"):
+        m = re.search(rx % (key, re.escape(val)), text, re.I)
+        if m:
+            return clean_text(html.unescape(m.group(1)))
+    return ""
+
+
+def _strip(raw):
+    return clean_text(html.unescape(_TAG_RX.sub(" ", raw)))
+
+
+def fast_info(text, url):
+    """DOM banaye bina title/author/lang (regex, bahut tez)."""
+    m = _H1_RX.search(text)
+    t = _strip(m.group(1)) if m else ""
+    t = t or _meta(text, "property", "og:title")
+    if not t:
+        m = _TITLE_RX.search(text)
+        t = _strip(m.group(1)) if m else ""
+    lm = _LANG_RX.search(text)
+    return {"title": plain(clean_book_title(t[:150])) or "Novel",
+            "author": (_meta(text, "name", "author") or "Unknown")[:100],
+            "lang": lm.group(1) if lm else "en", "url": url}
+
+
+def fast_toc(text, url):
+    """Chapter list regex se nikalo (DOM parse se 10-50x tez). Shak ho to [] -> purana DOM tareeka chalega."""
+    host = _norm_host(url)
+    groups = {}
+    for m in _A_RX.finditer(text):
+        hm = _HREF_RX.search(m.group(1))
+        if not hm:
+            continue
+        href = html.unescape((hm.group(1) or hm.group(2) or hm.group(3) or "").strip())
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+        full = parse.urljoin(url, href).split("#")[0]
+        if not full.startswith("http") or _norm_host(full) != host:
+            continue
+        d = parse.urlparse(full).path.rsplit("/", 1)[0]
+        groups.setdefault(d, {}).setdefault(full, _strip(m.group(2))[:150])
+    best = None
+    for links in groups.values():
+        n = len(links)
+        if n < MIN_TOC:
+            continue
+        likes = sum(1 for u, t in links.items() if re.search(r"\d", t + u))
+        if likes < 0.5 * n:
+            continue
+        if best is None or n > len(best):
+            best = links
+    if best is None:
+        return []
+    items = list(best.items())  # (url, title)
+    nums = [_num(t, u) for u, t in items]
+    known = [x for x in nums if x is not None]
+    if len(known) >= 3 and known[0] > known[-1]:
+        items.reverse()
+        known.reverse()
+    if len(known) >= 3:  # order sahi na lage (sidebar mix) to DOM wale tareeke par chhodo
+        ok = sum(1 for a, b in zip(known, known[1:]) if b >= a)
+        if ok < 0.9 * (len(known) - 1):
+            return []
+    return [Ref(t or f"Chapter {i}", u) for i, (u, t) in enumerate(items, 1)]
+
+
 def find_toc(dom, url):
     """Page par sabse badi 'chapter links ki list' dhoondo (ek hi folder ke links, ek hi container me)."""
     host = _norm_host(url)
@@ -898,6 +975,25 @@ def make_chapter(title, dom):
         return _failed(title, e)
 
 
+_FAST_SEL = ("#chr-content", "#chapter-content", ".chapter-content", ".reading-content", "#storytext",
+             "#chapterText", ".chapter-body", "#chapter-body", ".chapter__content")
+_FAST_RX = [re.compile(r"<[a-zA-Z][\w:-]*\b[^<>]*?\bid\s*=\s*[\"']%s[\"']" % re.escape(x[1:]), re.I) if x[0] == "#"
+            else re.compile(r"<[a-zA-Z][\w:-]*\b[^<>]*?\bclass\s*=\s*[\"'][^\"']*(?<![\w-])%s(?![\w-])" % re.escape(x[1:]), re.I)
+            for x in _FAST_SEL]
+
+
+def chapter_from_text(title, text):
+    """Page ka sirf content wala hissa parse karo (header/sidebar/head chhod ke) - tez. Na mile to poora page."""
+    for rx in _FAST_RX:
+        m = rx.search(text)
+        if m:
+            try:
+                return build_body(title, extract_content(parse_html(text[m.start():])))
+            except ParseError:
+                break
+    return build_body(title, extract_content(parse_html(text)))
+
+
 def fetch_chapter(ref, tries=CH_TRIES, cancel=None):
     """Download + parse, fail ho to thoda ruk ke dobara (har baar naya page)."""
     why = None
@@ -905,7 +1001,7 @@ def fetch_chapter(ref, tries=CH_TRIES, cancel=None):
         if cancel is not None and cancel.is_set():
             break
         try:
-            return Chapter(ref.title, build_body(ref.title, extract_content(get_dom(ref.url))))
+            return Chapter(ref.title, chapter_from_text(ref.title, slim_html(decode(*fetch(ref.url)))))
         except FetchError as e:
             why = e
             if "HTTP 404" in str(e) or "HTTP 410" in str(e):
@@ -1400,13 +1496,19 @@ class Bot:
             sess.mid = self.say(chat, text, markup)
         return sess
 
+    def scan_new(self, chat, url, preset, uid):
+        self.scan(self.new_session(chat, url), preset, uid)
+
     def scan(self, sess, preset, uid):
         chat = sess.chat
         try:
             check_public(sess.url)
-            dom = get_dom(sess.url)
-            info = book_info(dom, sess.url)
-            refs = find_toc(dom, sess.url)
+            text = slim_html(decode(*fetch(sess.url)))
+            dom, info, refs = None, fast_info(text, sess.url), fast_toc(text, sess.url)
+            if len(refs) < MIN_TOC:  # fast tareeka fail -> purana (dheema par pakka) tareeka
+                dom = parse_html(text)
+                info = book_info(dom, sess.url)
+                refs = find_toc(dom, sess.url)
         except (FetchError, ParseError) as e:
             self.drop_session(sess)
             self.edit(chat, sess.mid, card("❌ Failed", "Link scan nahi hua", [cut(str(e), 80)], foot="Sahi link bhejo"),
@@ -1613,8 +1715,7 @@ class Bot:
                     self.say(chat, card("⚠️ Range galat hai", None, [f"{first}-{last}", "Ye link chhod diya."]))
                     continue
                 preset = (first, last)
-            sess = self.new_session(chat, url)
-            threading.Thread(target=self.scan, args=(sess, preset, uid), daemon=True).start()
+            threading.Thread(target=self.scan_new, args=(chat, url, preset, uid), daemon=True).start()
 
     # ---- button presses
     def on_callback(self, cq):
@@ -1787,7 +1888,8 @@ class Bot:
                 with lk:
                     done[0] += 1
 
-        threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(WORKERS, total))]
+        n_thr = max(MIN_WORKERS * 2, min(WORKERS, TOTAL_WORKERS // max(len(self.jobs), 1)))
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(n_thr, total))]
         for t in threads:
             t.start()
         while any(t.is_alive() for t in threads):
