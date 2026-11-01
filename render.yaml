@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: novel-epub-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python novel_epub_bot.py
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
