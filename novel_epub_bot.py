@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Novel -> EPUB Telegram Bot (sirf standard library, ek hi file) [v7 - no banner photo]
+Novel -> EPUB Telegram Bot (sirf standard library, ek hi file) [v6 - single message flow]
 
 Chalane ke liye: python novel_epub_bot.py (Pydroid3: bas Run dabao)
 
-v7 me kya naya hai:
-* Blue banner photo band (BANNER khali hai to koi photo nahi aati, sirf text message)
-* Preset 20-100 ab 21-100 hai
-* Scan ka timing + fail logs (Render logs me dikhte hain) - slow hone ki wajah pata chalegi
+v6 me kya naya hai (video jaisa flow):
+* Link bhejo -> ek banner-wala message banta hai (scan -> range/options -> progress)
+* "Create EPUB Book" dabate hi wahi message progress me badal jata hai
+* EPUB ready hote hi usi message ki jagah file aa jati hai (editMessageMedia)
+* BANNER khali ho to bot khud ek default banner bana leta hai (photo message zaroori hai)
 """
 from __future__ import annotations
 
@@ -43,7 +44,7 @@ from urllib import error, parse, request
 # ============================== CONFIG ==============================
 BOT_TOKEN = ""  # Render par Environment Variable TELEGRAM_BOT_TOKEN me daalo (yahan mat likho)
 ALLOWED_USERS = {8049392574}  # Admin ID added
-WORKERS = int(os.environ.get("WORKERS", 32))  # ek job ke max parallel chapters
+WORKERS = int(os.environ.get("WORKERS", 25))  # ek job ke max parallel chapters
 TOTAL_WORKERS = int(os.environ.get("TOTAL_WORKERS", 64))  # sab jobs milake max threads (jobs badhne par har job ke workers khud kam hote hain)
 HOST_MAX = int(os.environ.get("HOST_MAX", 48))  # ek SITE par sab jobs milake max ek saath requests (alag site = alag limit)
 MIN_WORKERS = 4  # block aane par bhi kam se kam itne chalenge
@@ -52,12 +53,13 @@ MAX_JOBS_TOTAL = int(os.environ.get("MAX_JOBS_TOTAL", 12))  # poore bot me ek sa
 MAX_CHAPTERS = int(os.environ.get("MAX_CHAPTERS", 1500))  # 512MB RAM ke liye
 MAX_PAGE_BYTES = 8 * 1024 * 1024
 TIMEOUT = 15  # ek request ka timeout (sec)
+CONNECT_TIMEOUT = 6  # connect hang ho to jaldi retry
 RETRIES = 3  # ek page ke liye network retries
 CH_TRIES = 2  # ek chapter ke liye poori try (download + parse)
 REPAIR_PASSES = 2  # fail chapters ko baad me dobara try karne ke round
 MIN_TOC = 5
 TG_LIMIT = 49 * 1024 * 1024
-BANNER = ""  # Photo chahiye to image ka URL ya file path daalo. Khali = koi photo nahi (sirf text message)
+BANNER = ""  # Apni photo: image ka URL ya phone par file ka path (jaise "/sdcard/banner.jpg"). Khali = bot khud banner banata hai
 SUPPORT_URL = ""  # "https://t.me/yourname" daalo to "Contact support" button dikhega. Khali = nahi dikhega
 USER_AGENTS = (
     "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36",
@@ -501,8 +503,11 @@ def _get_once(url, headers):
         reused = c is not None
         if c is None:
             cls = http.client.HTTPSConnection if p.scheme == "https" else http.client.HTTPConnection
-            c = pool[key] = cls(p.hostname, p.port, timeout=TIMEOUT)
+            c = pool[key] = cls(p.hostname, p.port, timeout=CONNECT_TIMEOUT)
         try:
+            if c.sock is None:
+                c.connect()  # connect ke liye chhota timeout, phir read ke liye normal
+                c.sock.settimeout(TIMEOUT)
             c.request("GET", path, headers=headers)
             r = c.getresponse()
             data = r.read(MAX_PAGE_BYTES + 1)
@@ -564,7 +569,8 @@ def _retry_after(h):
         return 0.0
 
 
-def fetch(url, retries=RETRIES):
+def fetch(url, retries=RETRIES, prio=False):
+    """prio=True: limiter ki line me nahi lagta (link scan ke liye - chapters ki queue ke peeche na ruke)."""
     check_public(url)
     p = parse.urlparse(url)
     lim = get_limiter(url)  # is site ka limiter (dusri sites ka asar nahi)
@@ -577,16 +583,18 @@ def fetch(url, retries=RETRIES):
     last = None
     for attempt in range(retries + 1):
         try:
-            lim.acquire()
-            try:
+            if prio:
                 status, hdrs, data = _get_following(url, headers)
-            finally:
-                lim.release()
+            else:
+                lim.acquire()
+                try:
+                    status, hdrs, data = _get_following(url, headers)
+                finally:
+                    lim.release()
         except FetchError:
             raise
         except (http.client.HTTPException, OSError, ValueError) as e:
             last = type(e).__name__
-            print(f"fetch {_host_key(url)}: {last} (try {attempt + 1}/{retries + 1})", file=sys.stderr, flush=True)
             if isinstance(e, (socket.timeout, TimeoutError, ConnectionError)):
                 lim.slow_down(hard=False)
             time.sleep(min(0.3 * (2 ** attempt), 4) + random.random() * 0.3)
@@ -598,7 +606,6 @@ def fetch(url, retries=RETRIES):
             lim.good()
             return out, hdrs.get("Content-Type", "")
         last = f"HTTP {status}"
-        print(f"fetch {_host_key(url)}: {last} (try {attempt + 1}/{retries + 1})", file=sys.stderr, flush=True)
         if status not in RETRY_CODES:
             break
         if status in HARD_CODES:
@@ -1002,7 +1009,9 @@ def fetch_chapter(ref, tries=CH_TRIES, cancel=None):
         if cancel is not None and cancel.is_set():
             break
         try:
-            return Chapter(ref.title, chapter_from_text(ref.title, slim_html(decode(*fetch(ref.url)))))
+            # retries=1: andar ki bahut saari retries se ek atka chapter 2 min tak rukta tha;
+            # baaki retry ye loop aur repair rounds sambhalte hain
+            return Chapter(ref.title, chapter_from_text(ref.title, slim_html(decode(*fetch(ref.url, 1)))))
         except FetchError as e:
             why = e
             if "HTTP 404" in str(e) or "HTTP 410" in str(e):
@@ -1097,8 +1106,8 @@ def tg_filename(name):
 
 
 # ============================== 5b. DEFAULT BANNER (PNG, bina library) ==============================
-def make_banner_png(w=800, h=320):
-    """Gradient banner (ab use nahi hota - sirf tab jab send_photo me default banner wapas chalu karo)."""
+def make_banner_png(w=480, h=192):
+    """Gradient banner. Photo message hona zaroori hai taaki baad me wahi message EPUB file ban sake."""
     rows = []
     for y in range(h):
         row = bytearray([0])
@@ -1113,6 +1122,16 @@ def make_banner_png(w=800, h=320):
 
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(b"".join(rows), 6)) + chunk(b"IEND", b""))
+
+
+_BANNER_PNG = []
+
+
+def banner_png():
+    """Banner ek baar banta hai aur yaad rehta hai (bot start hote hi background me ready ho jata hai)."""
+    if not _BANNER_PNG:
+        _BANNER_PNG.append(make_banner_png())
+    return _BANNER_PNG[0]
 
 
 # ============================== 6. TELEGRAM ==============================
@@ -1162,7 +1181,7 @@ class TelegramAPI:
         return data["result"]
 
 
-# ============================== 7. UI (quote cards + coloured buttons) ==============================
+# ============================== 7. UI (banner + quote cards + coloured buttons) ==============================
 URL_RE = re.compile(r'https?://[^\s<>"\']+')
 RANGE_RE = re.compile(r"(?<!\d)(\d+)\s*[-–—]\s*(\d*)(?!\d)")
 SESSION_TTL = 1800  # link bhejne ke baad range chunne ke liye 30 min
@@ -1278,7 +1297,7 @@ def nav_kb(*top):
 HELP_CARD = card("📖 How to use", "Novel → EPUB in 3 steps", [
     "1️⃣ Novel ka link bhejo",
     "2️⃣ Total chapters dikhenge, range chuno",
-    "3️⃣ EPUB ready hote hi bhej di jayegi",
+    "3️⃣ EPUB ready hote hi usi message me mil jayegi",
 ], [
     "⚡ Shortcut · link ke baad range likho",
     "https://site.com/novel/x 5-50",
@@ -1362,9 +1381,7 @@ class Bot:
             return None
 
     def send_photo(self, chat, text, markup=None):
-        """Photo + caption. BANNER khali hai to photo nahi bhejta (None), caller text message bhej deta hai."""
-        if not BANNER:
-            return None
+        """Banner photo + caption. Ye message baad me edit hoke progress aur phir EPUB file ban jata hai."""
         p = {"chat_id": chat, "caption": text[:1000], "parse_mode": "HTML"}
         try:
             if self._banner_id:
@@ -1376,10 +1393,10 @@ class Bot:
                     p["reply_markup"] = markup
                 r = self.api.call("sendPhoto", dict(p, photo=BANNER), timeout=30)
             else:
-                if os.path.isfile(BANNER):
+                if BANNER and os.path.isfile(BANNER):
                     data, fname = Path(BANNER).read_bytes(), os.path.basename(BANNER)
                 else:
-                    data, fname = make_banner_png(), "banner.png"
+                    data, fname = banner_png(), "banner.png"
                 if markup:
                     p["reply_markup"] = json.dumps(markup)
                 mime = "image/png" if fname.lower().endswith(".png") else "image/jpeg"
@@ -1448,7 +1465,7 @@ class Bot:
         ])
 
     def welcome(self, chat, name="Friend", uid=0):
-        """Naya /start message. Baaki sab screens isi message me edit hoti hain."""
+        """Naya /start message (banner ke saath). Baaki sab screens isi message me edit hoti hain."""
         text, markup = self.welcome_text(name, uid), menu_kb()
         if self.send_photo(chat, text, markup) is None:
             self.say(chat, text, markup)
@@ -1500,22 +1517,33 @@ class Bot:
         return sess
 
     def scan_new(self, chat, url, preset, uid):
-        self.scan(self.new_session(chat, url), preset, uid)
+        box = {}
 
-    def scan(self, sess, preset, uid):
+        def work():  # page download banner message bhejne ke saath-saath chalta hai
+            try:
+                check_public(url)
+                text = slim_html(decode(*fetch(url, prio=True)))
+                dom, info, refs = None, fast_info(text, url), fast_toc(text, url)
+                if len(refs) < MIN_TOC:  # fast tareeka fail -> purana (dheema par pakka) tareeka
+                    dom = parse_html(text)
+                    info = book_info(dom, url)
+                    refs = find_toc(dom, url)
+                box["r"] = (info, refs, dom)
+            except Exception as e:  # noqa: BLE001
+                box["e"] = e
+
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        sess = self.new_session(chat, url)
+        t.join()
+        self.scan(sess, preset, uid, box)
+
+    def scan(self, sess, preset, uid, box):
         chat = sess.chat
         try:
-            t0 = time.monotonic()
-            check_public(sess.url)
-            text = slim_html(decode(*fetch(sess.url)))
-            t1 = time.monotonic()
-            dom, info, refs = None, fast_info(text, sess.url), fast_toc(text, sess.url)
-            if len(refs) < MIN_TOC:  # fast tareeka fail -> purana (dheema par pakka) tareeka
-                dom = parse_html(text)
-                info = book_info(dom, sess.url)
-                refs = find_toc(dom, sess.url)
-            print(f"scan {_host_key(sess.url)}: download {t1 - t0:.1f}s, parse {time.monotonic() - t1:.1f}s, "
-                  f"chapters={len(refs)}", flush=True)
+            if "e" in box:
+                raise box["e"]
+            info, refs, dom = box["r"]
         except (FetchError, ParseError) as e:
             self.drop_session(sess)
             self.edit(chat, sess.mid, card("❌ Failed", "Link scan nahi hua", [cut(str(e), 80)], foot="Sahi link bhejo"),
@@ -1631,8 +1659,8 @@ class Bot:
                   throttle=False)
 
     def deliver(self, job, cap, fname, data):
-        """Agar progress message photo wala ho to EPUB usi ki jagah aa jati hai (editMessageMedia),
-        warna naya document message jata hai. True = usi message me gayi."""
+        """EPUB usi progress message ki jagah aa jati hai (editMessageMedia). Na ho paye to naya document bhejo.
+        True = usi message me gayi."""
         chat, mid = job.chat, job.mid
         if mid is not None and (chat, mid) in self._photos:
             media = {"type": "document", "media": "attach://book", "caption": cap[:1000], "parse_mode": "HTML"}
@@ -1854,7 +1882,7 @@ class Bot:
             stats_add(job.uid)
             if not in_place:  # file naye message me gayi, progress message ko "Completed" dikhao
                 self.finish(job, "✅ Completed", f"Job #{job.jid}", [f"📖 {cut(info['title'], 50)}"], summary,
-                            "EPUB neeche bhej di gayi")
+                            "EPUB upar bhej di gayi")
             if bad:
                 self.say(chat, card(f"⚠️ #{job.jid} · {len(bad)} chapters fail", "Site se nahi aaye",
                                     quote=[cut(c.title, 40) for c in bad[:20]], foot="Wahi range dobara bhejo"))
@@ -1956,6 +1984,7 @@ class Bot:
     # ---- main loop
     def run(self):
         me = self.api.call("getMe")
+        threading.Thread(target=banner_png, daemon=True).start()  # banner pehle se ready rakho
         try:
             self.api.call("deleteWebhook")
         except TelegramError:
