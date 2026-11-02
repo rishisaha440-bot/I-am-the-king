@@ -1581,9 +1581,7 @@ class Bot:
                 self.awaiting.pop(sess.chat, None)
 
     def visible_presets(self, sess):
-        total = len(sess.refs)
-        return [(k, a, b) for k, a, b in PRESETS
-                if not total or (a <= total and not (a == 1 and b >= total))]
+        return list(PRESETS)  # sab options hamesha dikhte hain (range novel se badi ho to chunne par batata hai)
 
     def sel_range(self, sess):
         total = len(sess.refs)
@@ -1599,6 +1597,8 @@ class Bot:
         vis = self.visible_presets(sess)
         if sess.sel == "cust" and not sess.custom or sess.sel not in ("all", "cust", *[k for k, _, _ in vis]):
             sess.sel = "all"
+        if total and any(sess.sel == k and a > total for k, a, _ in PRESETS):
+            sess.sel = "all"
         first, last = self.sel_range(sess)
 
         def opt(key, label):
@@ -1609,8 +1609,8 @@ class Bot:
             return f"{a:02d}-{b}" if b else f"{a:02d}-end"
 
         row1 = [opt("all", "✂️ No cut" if total else "✂️ No cut (slow)")]
-        row1 += [opt(k, span(a, min(b, total) if total else b)) for k, a, b in vis[:2]]
-        row2 = [opt(k, span(a, min(b, total) if total else b)) for k, a, b in vis[2:]]
+        row1 += [opt(k, span(a, b)) for k, a, b in vis[:2]]  # labels fixed: 01-20 / 21-100 / 01-100
+        row2 = [opt(k, span(a, b)) for k, a, b in vis[2:]]
         row2.append(btn(f"◉ ✏️ {span(first, last)}", f"p:{sid}:c", "success") if sess.sel == "cust"
                     else btn("✏️ Custom…", f"p:{sid}:c"))
         if total:
@@ -1632,6 +1632,8 @@ class Bot:
     # ---- job start (limits check + thread)
     def start_job(self, sess, uid, first, last):
         chat = sess.chat
+        if sess.refs and first > len(sess.refs):
+            return f"Novel me sirf {len(sess.refs)} chapters hain, {first}-{last or 'end'} nahi ban sakta."
         with self.lock:
             if len(self.jobs) >= MAX_JOBS_TOTAL:
                 return "Bot par abhi bahut kaam hai, thodi der baad try karo."
@@ -1823,6 +1825,9 @@ class Bot:
                     pref["range"] = list(sess.custom)
                 prefs_save(uid, pref)
                 self.answer(cid, "💾 Default save ho gaya")
+            elif choice in [k for k, a, _ in PRESETS if total and a > total]:
+                a = next(a for k, a, _ in PRESETS if k == choice)
+                self.answer(cid, f"Novel me sirf {total} chapters hain, {a} se range nahi ban sakti", True)
             elif choice == "all" or choice in [k for k, _, _ in PRESETS]:
                 sess.sel = choice
                 with self.lock:
