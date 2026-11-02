@@ -1,18 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Novel -> EPUB Telegram Bot (sirf standard library, ek hi file) [v6 - single message flow]
+Novel -> EPUB Telegram Bot (sirf standard library, ek hi file) [v6 - fast + stable]
 
 Chalane ke liye: python novel_epub_bot.py (Pydroid3: bas Run dabao)
 
-v6 me kya naya hai (video jaisa flow):
-* Link bhejo -> ek banner-wala message banta hai (scan -> range/options -> progress)
-* "Create EPUB Book" dabate hi wahi message progress me badal jata hai
-* EPUB ready hote hi usi message ki jagah file aa jati hai (editMessageMedia)
-* BANNER khali ho to bot khud ek default banner bana leta hai (photo message zaroori hai)
+v6 me kya naya hai:
+* EPUB ka naam/range EXACT wahi jo chuni (21-100 -> [ 21-100 ], utne hi chapters)
+* Har EPUB ka alag internal ID (pehle same novel ki alag ranges ek hi book lagti thi -> same content dikhta tha)
+* Same-content (site ka block/limit page) pakad ke dobara download
+* Shared keep-alive connections + fast chapter extract (parse bahut kam) = tez
+* DNS/scan/upload retry, streaming upload (RAM kam), badi EPUB auto-split, flood-safe edits
+
+v5 me kya tha:
+* Professional UI: banner photo, quote cards, rangeen buttons, live progress bar, range chunne ke buttons
+* Menu navigation isi message me (Refresh / Back / Close), naya message nahi aata
+* Flow: link bhejo -> total chapters dikhenge -> range chuno (No cut / 01-20 / 21-100 / 01-100 / Custom) -> Create EPUB Book
+* 10 EPUB ek saath, tez download (48 workers/job, 128/site)
+
+v4 me kya tha:
+* Ek saath MULTIPLE EPUB: ek message me kai links, ya alag-alag message me - sab parallel chalte hain
+* Har job ke apne 32 workers. Speed limiter ab PER-SITE hai (global nahi), isliye
+  alag-alag sites ke jobs ek dusre ko slow nahi karte
+* Har job ka apna progress message (#id ke saath), edit throttle ab per-message hai
+* /cancel (sab) ya /cancel 3 (sirf job #3)
+* Baaki sab v3 jaisa: offset fix, IPv4 first, keep-alive, tez parse, daemon threads
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import http.client
 import ipaddress
@@ -23,7 +39,6 @@ import random
 import re
 import shutil
 import socket
-import struct
 import sys
 import tempfile
 import threading
@@ -37,29 +52,26 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from html.parser import HTMLParser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib import error, parse, request
 
 # ============================== CONFIG ==============================
-BOT_TOKEN = ""  # Render par Environment Variable TELEGRAM_BOT_TOKEN me daalo (yahan mat likho)
+BOT_TOKEN = "8897407705:AAGFieDsonOfzTDBubZarAZB5wZuOzpTym8"
 ALLOWED_USERS = {8049392574}  # Admin ID added
-WORKERS = int(os.environ.get("WORKERS", 25))  # ek job ke max parallel chapters
-TOTAL_WORKERS = int(os.environ.get("TOTAL_WORKERS", 64))  # sab jobs milake max threads (jobs badhne par har job ke workers khud kam hote hain)
-HOST_MAX = int(os.environ.get("HOST_MAX", 48))  # ek SITE par sab jobs milake max ek saath requests (alag site = alag limit)
+WORKERS = 48  # ek JOB ke max ek saath chapters
+HOST_MAX = 128  # ek SITE par sab jobs milake max ek saath requests (alag site = alag limit)
 MIN_WORKERS = 4  # block aane par bhi kam se kam itne chalenge
-MAX_JOBS_PER_CHAT = int(os.environ.get("MAX_JOBS_PER_CHAT", 10))  # ek chat me ek saath max EPUB jobs
-MAX_JOBS_TOTAL = int(os.environ.get("MAX_JOBS_TOTAL", 12))  # poore bot me ek saath max jobs
-MAX_CHAPTERS = int(os.environ.get("MAX_CHAPTERS", 1500))  # 512MB RAM ke liye
+MAX_JOBS_PER_CHAT = 10  # ek chat me ek saath max EPUB jobs
+MAX_JOBS_TOTAL = 10  # poore bot me ek saath max jobs
+MAX_CHAPTERS = 3000
 MAX_PAGE_BYTES = 8 * 1024 * 1024
-TIMEOUT = 15  # ek request ka timeout (sec)
-CONNECT_TIMEOUT = 6  # connect hang ho to jaldi retry
+TIMEOUT = 20  # ek request ka timeout (sec)
 RETRIES = 3  # ek page ke liye network retries
 CH_TRIES = 2  # ek chapter ke liye poori try (download + parse)
-REPAIR_PASSES = 2  # fail chapters ko baad me dobara try karne ke round
+REPAIR_PASSES = 3  # fail chapters ko baad me dobara try karne ke round
 MIN_TOC = 5
 TG_LIMIT = 49 * 1024 * 1024
-BANNER = ""  # Apni photo: image ka URL ya phone par file ka path (jaise "/sdcard/banner.jpg"). Khali = bot khud banner banata hai
+BANNER = ""  # /start ke upar ki photo: image ka URL ya phone par file ka path (jaise "/sdcard/banner.jpg"). Khali = bina photo
 SUPPORT_URL = ""  # "https://t.me/yourname" daalo to "Contact support" button dikhega. Khali = nahi dikhega
 USER_AGENTS = (
     "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36",
@@ -112,7 +124,7 @@ class Limiter:
     def acquire(self):
         with self.cv:
             while self.active >= self.limit or time.monotonic() < self.pause_until:
-                self.cv.wait(0.05)
+                self.cv.wait(0.3)
             self.active += 1
 
     def release(self):
@@ -123,7 +135,7 @@ class Limiter:
     def good(self):
         with self.cv:
             self.streak += 1
-            if self.streak >= 3 and self.limit < self.max:
+            if self.streak >= 4 and self.limit < self.max:
                 self.limit = min(self.max, self.limit + 4)
                 self.streak = 0
                 self.cv.notify_all()
@@ -453,10 +465,17 @@ def prune(root):
 # ============================== 3. HTTP (keep-alive, cookies, redirects) ==============================
 @lru_cache(maxsize=512)
 def _host_is_public(host, port):
-    try:
-        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-    except (socket.gaierror, UnicodeError):
-        raise FetchError("Host resolve nahi hua") from None
+    infos = None
+    for attempt in range(4):  # kai links ek saath aane par DNS kabhi kabhi atak jata hai -> dobara try
+        try:
+            infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+            break
+        except UnicodeError:
+            raise FetchError("Host resolve nahi hua") from None
+        except socket.gaierror:
+            if attempt == 3:
+                raise FetchError("Host resolve nahi hua") from None
+            time.sleep(0.5 * (attempt + 1))
     for info in infos:
         ip = ipaddress.ip_address(info[4][0].split("%")[0])
         if ip.version == 6 and ip.ipv4_mapped:
@@ -476,19 +495,33 @@ def check_public(url):
         raise FetchError("Link galat hai") from None
 
 
-_tls = threading.local()
 COOKIES = {}  # host -> {name: value}
 _REDIRECTS = (301, 302, 303, 307, 308)
 _SAFE = "/%:@!$&'()*+,;=-._~"
-_STALE = (http.client.BadStatusLine, http.client.CannotSendRequest, ConnectionError)
+_IDLE = {}  # (scheme, host, port) -> khali keep-alive connections; SAB threads/jobs share karte hain (TLS handshake bachta hai)
+_IDLE_LOCK = threading.Lock()
 
 
-def _pool():
-    p = getattr(_tls, "pool", None)
-    if p is None:
-        p = _tls.pool = {}
-        _tls.ua = random.choice(USER_AGENTS)  # ek thread = ek browser (cookies ke saath mel khata hai)
-    return p
+def _ua_for(host):
+    return USER_AGENTS[zlib.crc32((host or "").encode()) % len(USER_AGENTS)]  # ek site = ek hi browser
+
+
+def _take_conn(key, p):
+    with _IDLE_LOCK:
+        lst = _IDLE.get(key)
+        if lst:
+            return lst.pop(), True
+    cls = http.client.HTTPSConnection if p.scheme == "https" else http.client.HTTPConnection
+    return cls(p.hostname, p.port, timeout=TIMEOUT), False
+
+
+def _give_conn(key, c):
+    with _IDLE_LOCK:
+        lst = _IDLE.setdefault(key, [])
+        if len(lst) < 64:
+            lst.append(c)
+            return
+    c.close()
 
 
 def _get_once(url, headers):
@@ -497,31 +530,23 @@ def _get_once(url, headers):
     path = parse.quote(p.path or "/", safe=_SAFE)
     if p.query:
         path += "?" + parse.quote(p.query, safe=_SAFE + "?")
-    pool = _pool()
     for attempt in (0, 1):
-        c = pool.get(key)
-        reused = c is not None
-        if c is None:
-            cls = http.client.HTTPSConnection if p.scheme == "https" else http.client.HTTPConnection
-            c = pool[key] = cls(p.hostname, p.port, timeout=CONNECT_TIMEOUT)
+        c, reused = _take_conn(key, p)  # connection ek waqt me sirf ek thread ke paas hota hai -> response mix nahi hota
         try:
-            if c.sock is None:
-                c.connect()  # connect ke liye chhota timeout, phir read ke liye normal
-                c.sock.settimeout(TIMEOUT)
             c.request("GET", path, headers=headers)
             r = c.getresponse()
             data = r.read(MAX_PAGE_BYTES + 1)
-            if r.will_close or len(data) > MAX_PAGE_BYTES:
-                c.close()
-                pool.pop(key, None)
+            if r.will_close or len(data) > MAX_PAGE_BYTES or not r.isclosed():
+                c.close()  # poora response nahi padha / server band kar raha hai -> reuse nahi
+            else:
+                _give_conn(key, c)
             return r.status, r.headers, data
-        except (http.client.HTTPException, OSError) as e:
+        except (http.client.HTTPException, OSError):
             try:
                 c.close()
             except Exception:  # noqa: BLE001
                 pass
-            pool.pop(key, None)
-            if reused and attempt == 0 and isinstance(e, _STALE):
+            if reused and attempt == 0:
                 continue  # purana keep-alive connection toot gaya tha, naya khol ke dobara
             raise
 
@@ -569,35 +594,30 @@ def _retry_after(h):
         return 0.0
 
 
-def fetch(url, retries=RETRIES, prio=False):
-    """prio=True: limiter ki line me nahi lagta (link scan ke liye - chapters ki queue ke peeche na ruke)."""
+def fetch(url, retries=RETRIES):
     check_public(url)
     p = parse.urlparse(url)
     lim = get_limiter(url)  # is site ka limiter (dusri sites ka asar nahi)
-    _pool()
     headers = {
-        "User-Agent": _tls.ua,
+        "User-Agent": _ua_for(p.hostname),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Encoding": "gzip, deflate", "Accept-Language": "en-US,en;q=0.9",
         "Referer": f"{p.scheme}://{p.netloc}/"}
     last = None
     for attempt in range(retries + 1):
         try:
-            if prio:
+            lim.acquire()
+            try:
                 status, hdrs, data = _get_following(url, headers)
-            else:
-                lim.acquire()
-                try:
-                    status, hdrs, data = _get_following(url, headers)
-                finally:
-                    lim.release()
+            finally:
+                lim.release()
         except FetchError:
             raise
         except (http.client.HTTPException, OSError, ValueError) as e:
             last = type(e).__name__
             if isinstance(e, (socket.timeout, TimeoutError, ConnectionError)):
                 lim.slow_down(hard=False)
-            time.sleep(min(0.3 * (2 ** attempt), 4) + random.random() * 0.3)
+            time.sleep(min(0.6 * (2 ** attempt), 8) + random.random() * 0.5)
             continue
         if 200 <= status < 300:
             if len(data) > MAX_PAGE_BYTES:
@@ -610,7 +630,7 @@ def fetch(url, retries=RETRIES, prio=False):
             break
         if status in HARD_CODES:
             lim.slow_down(min(max(_retry_after(hdrs), 2 * (attempt + 1)), 30))
-        time.sleep(min(0.3 * (2 ** attempt), 4) + random.random() * 0.3)
+        time.sleep(min(0.6 * (2 ** attempt), 8) + random.random() * 0.5)
     raise FetchError(f"Download fail: {last}")
 
 
@@ -634,8 +654,12 @@ def decode(data, ctype=""):
     return data.decode("cp1252", "replace")
 
 
-def get_dom(url):
-    return parse_html(slim_html(decode(*fetch(url))))
+def get_html(url, retries=RETRIES):
+    return slim_html(decode(*fetch(url, retries)))
+
+
+def get_dom(url, retries=RETRIES):
+    return parse_html(get_html(url, retries))
 
 
 # ============================== 4. NOVEL LOGIC ==============================
@@ -667,82 +691,6 @@ def _num(text, href):
         return float(m[0])
     m = re.findall(r"\d+(?:\.\d+)?", href or "")
     return float(m[-1]) if m else None
-
-
-_A_RX = re.compile(r"<a\b([^>]*?)>(.*?)</a\s*>", re.I | re.S)
-_HREF_RX = re.compile(r"""\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", re.I)
-_TAG_RX = re.compile(r"<[^>]+>")
-_H1_RX = re.compile(r"<h1\b[^>]*>(.*?)</h1>", re.I | re.S)
-_TITLE_RX = re.compile(r"<title\b[^>]*>(.*?)</title>", re.I | re.S)
-_LANG_RX = re.compile(r"<html\b[^>]*?\blang\s*=\s*[\"']([\w-]+)", re.I)
-
-
-def _meta(text, key, val):
-    for rx in (r"<meta\b[^>]*?\b%s\s*=\s*[\"']%s[\"'][^>]*?\bcontent\s*=\s*[\"']([^\"']*)",
-               r"<meta\b[^>]*?\bcontent\s*=\s*[\"']([^\"']*)[\"'][^>]*?\b%s\s*=\s*[\"']%s[\"']"):
-        m = re.search(rx % (key, re.escape(val)), text, re.I)
-        if m:
-            return clean_text(html.unescape(m.group(1)))
-    return ""
-
-
-def _strip(raw):
-    return clean_text(html.unescape(_TAG_RX.sub(" ", raw)))
-
-
-def fast_info(text, url):
-    """DOM banaye bina title/author/lang (regex, bahut tez)."""
-    m = _H1_RX.search(text)
-    t = _strip(m.group(1)) if m else ""
-    t = t or _meta(text, "property", "og:title")
-    if not t:
-        m = _TITLE_RX.search(text)
-        t = _strip(m.group(1)) if m else ""
-    lm = _LANG_RX.search(text)
-    return {"title": plain(clean_book_title(t[:150])) or "Novel",
-            "author": (_meta(text, "name", "author") or "Unknown")[:100],
-            "lang": lm.group(1) if lm else "en", "url": url}
-
-
-def fast_toc(text, url):
-    """Chapter list regex se nikalo (DOM parse se 10-50x tez). Shak ho to [] -> purana DOM tareeka chalega."""
-    host = _norm_host(url)
-    groups = {}
-    for m in _A_RX.finditer(text):
-        hm = _HREF_RX.search(m.group(1))
-        if not hm:
-            continue
-        href = html.unescape((hm.group(1) or hm.group(2) or hm.group(3) or "").strip())
-        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
-            continue
-        full = parse.urljoin(url, href).split("#")[0]
-        if not full.startswith("http") or _norm_host(full) != host:
-            continue
-        d = parse.urlparse(full).path.rsplit("/", 1)[0]
-        groups.setdefault(d, {}).setdefault(full, _strip(m.group(2))[:150])
-    best = None
-    for links in groups.values():
-        n = len(links)
-        if n < MIN_TOC:
-            continue
-        likes = sum(1 for u, t in links.items() if re.search(r"\d", t + u))
-        if likes < 0.5 * n:
-            continue
-        if best is None or n > len(best):
-            best = links
-    if best is None:
-        return []
-    items = list(best.items())  # (url, title)
-    nums = [_num(t, u) for u, t in items]
-    known = [x for x in nums if x is not None]
-    if len(known) >= 3 and known[0] > known[-1]:
-        items.reverse()
-        known.reverse()
-    if len(known) >= 3:  # order sahi na lage (sidebar mix) to DOM wale tareeke par chhodo
-        ok = sum(1 for a, b in zip(known, known[1:]) if b >= a)
-        if ok < 0.9 * (len(known) - 1):
-            return []
-    return [Ref(t or f"Chapter {i}", u) for i, (u, t) in enumerate(items, 1)]
 
 
 def find_toc(dom, url):
@@ -956,6 +904,57 @@ def extract_content(dom):
     return node
 
 
+def _fast_pat(sel):
+    n = re.escape(sel[1:])
+    if sel[0] == "#":
+        return re.compile(r"""<([A-Za-z][\w-]*)\b[^>]*?\bid\s*=\s*["']%s["'][^>]*>""" % n, re.I)
+    if sel[0] == ".":
+        return re.compile(r"""<([A-Za-z][\w-]*)\b[^>]*?\bclass\s*=\s*["'](?:[^"']*\s)?%s(?:\s[^"']*)?["'][^>]*>""" % n, re.I)
+    return re.compile(r"<(%s)\b[^>]*>" % re.escape(sel), re.I)
+
+
+_FAST_PATS = [_fast_pat(x) for x in CONTENT_SELECTORS]
+_TAG_STRIP = re.compile(r"<[^>]+>")
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+
+
+def _balanced(text, start, tag):
+    """Tag ke andar ka hissa (nested same-tag ginte hue)."""
+    rx = re.compile(r"<(/?)%s\b[^>]*?(/?)>" % re.escape(tag), re.I)
+    depth = 1
+    for m in rx.finditer(text, start):
+        if m.group(1):
+            depth -= 1
+            if depth == 0:
+                return text[start:m.start()]
+        elif not m.group(2):
+            depth += 1
+    return text[start:]
+
+
+def fast_content(text):
+    """Chapter ka container regex se dhoondh ke sirf wahi parse karo (poora page parse karne se ~5x tez).
+    Na mile to None -> purana poora parse wala rasta."""
+    if len(text) < 3000:
+        return None
+    t = _TITLE_RE.search(text)
+    if t and _BLOCK_RE.search(t.group(1)):
+        return None
+    for pat in _FAST_PATS:
+        m = pat.search(text)
+        if m is None:
+            continue
+        frag = _balanced(text, m.end(), m.group(1))
+        if len(clean_text(_TAG_STRIP.sub(" ", frag))) >= 150:
+            return parse_html(frag)
+    return None
+
+
+def page_to_node(text):
+    node = fast_content(text)
+    return node if node is not None else extract_content(parse_html(text))
+
+
 def build_body(title, node):
     wrap = Node("div")
     wrap.append(node)
@@ -983,23 +982,22 @@ def make_chapter(title, dom):
         return _failed(title, e)
 
 
-_FAST_SEL = ("#chr-content", "#chapter-content", ".chapter-content", ".reading-content", "#storytext",
-             "#chapterText", ".chapter-body", "#chapter-body", ".chapter__content")
-_FAST_RX = [re.compile(r"<[a-zA-Z][\w:-]*\b[^<>]*?\bid\s*=\s*[\"']%s[\"']" % re.escape(x[1:]), re.I) if x[0] == "#"
-            else re.compile(r"<[a-zA-Z][\w:-]*\b[^<>]*?\bclass\s*=\s*[\"'][^\"']*(?<![\w-])%s(?![\w-])" % re.escape(x[1:]), re.I)
-            for x in _FAST_SEL]
-
-
-def chapter_from_text(title, text):
-    """Page ka sirf content wala hissa parse karo (header/sidebar/head chhod ke) - tez. Na mile to poora page."""
-    for rx in _FAST_RX:
-        m = rx.search(text)
-        if m:
-            try:
-                return build_body(title, extract_content(parse_html(text[m.start():])))
-            except ParseError:
-                break
-    return build_body(title, extract_content(parse_html(text)))
+def mark_dupes(results):
+    """Alag chapters ka bilkul same lamba text = site ne block/limit/home page diya. Unhe fail maano (dobara try honge)."""
+    seen = {}
+    for i, c in enumerate(results):
+        if c is None or not c.ok:
+            continue
+        t = clean_text(_TAG_STRIP.sub(" ", c.body.split("</h2>", 1)[-1]))
+        if len(t) >= 200:
+            seen.setdefault(hashlib.sha1(t.encode("utf-8", "ignore")).digest(), []).append(i)
+    n = 0
+    for idxs in seen.values():
+        if len(idxs) > 1:
+            for i in idxs:
+                results[i] = _failed(results[i].title, "site ne same content diya")
+                n += 1
+    return n
 
 
 def fetch_chapter(ref, tries=CH_TRIES, cancel=None):
@@ -1009,16 +1007,14 @@ def fetch_chapter(ref, tries=CH_TRIES, cancel=None):
         if cancel is not None and cancel.is_set():
             break
         try:
-            # retries=1: andar ki bahut saari retries se ek atka chapter 2 min tak rukta tha;
-            # baaki retry ye loop aur repair rounds sambhalte hain
-            return Chapter(ref.title, chapter_from_text(ref.title, slim_html(decode(*fetch(ref.url, 1)))))
+            return Chapter(ref.title, build_body(ref.title, page_to_node(get_html(ref.url))))
         except FetchError as e:
             why = e
             if "HTTP 404" in str(e) or "HTTP 410" in str(e):
                 break  # chapter hai hi nahi, retry bekaar
         except Exception as e:  # noqa: BLE001 (ek chapter poora kaam na roke)
             why = e
-        time.sleep(min(0.5 * (i + 1), 3) + random.random() * 0.5)
+        time.sleep(min(1.0 * (i + 1), 5) + random.random())
     return _failed(ref.title, why or "cancel")
 
 
@@ -1037,7 +1033,9 @@ CSS = "body{margin:5%;line-height:1.5}\nh1,h2{text-align:center}\np{margin:.6em 
 
 def pack_epub(info, chapters, out):
     lang = info["lang"]
-    ident = "urn:uuid:" + str(uuid.uuid5(uuid.NAMESPACE_URL, info["url"]))
+    sig = hashlib.sha1("|".join(f"{c.title}:{len(c.body)}" for c in chapters).encode("utf-8", "ignore")).hexdigest()
+    # har range/content ka alag ID, warna reader (Moon+ etc.) alag EPUB ko ek hi book samajh ke purana content dikhata hai
+    ident = "urn:uuid:" + str(uuid.uuid5(uuid.NAMESPACE_URL, f'{info["url"]}|{info["title"]}|{sig}'))
     mod = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     names = [f"Section{i:04d}.xhtml" for i in range(1, len(chapters) + 1)]
     manifest = ['<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
@@ -1065,7 +1063,7 @@ def pack_epub(info, chapters, out):
     def b(s):
         return s.encode("utf-8", "replace")
 
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as z:  # level 1 = sabse tez
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=4) as z:  # level 4 = tez + chhota
         z.writestr(zipfile.ZipInfo("mimetype"), "application/epub+zip", compress_type=zipfile.ZIP_STORED)
         z.writestr("META-INF/container.xml", b(container))
         for name, text in (("content.opf", opf), ("nav.xhtml", nav), ("toc.ncx", ncx), ("styles.css", CSS)):
@@ -1103,35 +1101,6 @@ _FANCY = str.maketrans({" ": "\u2002", "[": "\uff3b", "]": "\uff3d", "-": "\u201
 def tg_filename(name):
     """Extension (.epub) isme nahi aata - wo baad me joda jata hai."""
     return name.translate(_FANCY) if FANCY_FILENAME else name
-
-
-# ============================== 5b. DEFAULT BANNER (PNG, bina library) ==============================
-def make_banner_png(w=480, h=192):
-    """Gradient banner. Photo message hona zaroori hai taaki baad me wahi message EPUB file ban sake."""
-    rows = []
-    for y in range(h):
-        row = bytearray([0])
-        for x in range(w):
-            t = (x / w) * 0.6 + (y / h) * 0.4
-            row += bytes((int(32 + 90 * t), int(24 + 50 * (1 - t)), int(96 + 120 * (1 - t))))
-        rows.append(bytes(row))
-
-    def chunk(tag, data):
-        c = struct.pack(">I", len(data)) + tag + data
-        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(b"".join(rows), 6)) + chunk(b"IEND", b""))
-
-
-_BANNER_PNG = []
-
-
-def banner_png():
-    """Banner ek baar banta hai aur yaad rehta hai (bot start hote hi background me ready ho jata hai)."""
-    if not _BANNER_PNG:
-        _BANNER_PNG.append(make_banner_png())
-    return _BANNER_PNG[0]
 
 
 # ============================== 6. TELEGRAM ==============================
@@ -1173,7 +1142,46 @@ class TelegramAPI:
                 data = json.loads(e.read())
             except ValueError:
                 raise TelegramError(f"{method}: HTTP {e.code}") from None
-        except (error.URLError, OSError, ValueError) as e:
+        except (error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+            raise TelegramError(f"{method}: network error ({type(e).__name__})") from None
+        if not data.get("ok"):
+            ra = (data.get("parameters") or {}).get("retry_after") or 0
+            raise TelegramError(f"{method}: {data.get('description', 'error')}", ra)
+        return data["result"]
+
+    def upload(self, method, params, field, path, fname, mime, timeout=600):
+        """File disk se chunk-chunk bhejo (poori file RAM me nahi aati)."""
+        b = uuid.uuid4().hex
+        head = "".join(f'--{b}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'
+                       for k, v in params.items()).encode()
+        fname = re.sub(r'[\r\n"]', "_", fname)
+        head += (f'--{b}\r\nContent-Disposition: form-data; name="{field}"; filename="{fname}"\r\n'
+                 f"Content-Type: {mime}\r\n\r\n").encode()
+        tail = f"\r\n--{b}--\r\n".encode()
+        total = len(head) + os.path.getsize(path) + len(tail)
+
+        def body():
+            yield head
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(262144)
+                    if not chunk:
+                        break
+                    yield chunk
+            yield tail
+
+        req = request.Request(f"{self.base}/bot{self.token}/{method}", data=body(),
+                              headers={"Content-Type": f"multipart/form-data; boundary={b}",
+                                       "Content-Length": str(total)})
+        try:
+            with request.urlopen(req, timeout=timeout) as r:
+                data = json.loads(r.read())
+        except error.HTTPError as e:
+            try:
+                data = json.loads(e.read())
+            except ValueError:
+                raise TelegramError(f"{method}: HTTP {e.code}") from None
+        except (error.URLError, OSError, ValueError, http.client.HTTPException) as e:
             raise TelegramError(f"{method}: network error ({type(e).__name__})") from None
         if not data.get("ok"):
             ra = (data.get("parameters") or {}).get("retry_after") or 0
@@ -1297,12 +1305,12 @@ def nav_kb(*top):
 HELP_CARD = card("📖 How to use", "Novel → EPUB in 3 steps", [
     "1️⃣ Novel ka link bhejo",
     "2️⃣ Total chapters dikhenge, range chuno",
-    "3️⃣ EPUB ready hote hi usi message me mil jayegi",
+    "3️⃣ EPUB ready hote hi mil jayegi",
 ], [
     "⚡ Shortcut · link ke baad range likho",
     "https://site.com/novel/x 5-50",
     "📚 Kai EPUB · kai links ek saath bhejo",
-], "/jobs · /cancel · /myid")
+], "/jobs · /cancel · /resetdefault")
 
 
 class Session:
@@ -1355,6 +1363,9 @@ def parse_range(text, total):
     return (first, last), None
 
 
+_UPLOAD_SEM = threading.Semaphore(3)
+
+
 class Bot:
     def __init__(self, api, allowed=None):
         self.api = api
@@ -1366,6 +1377,7 @@ class Bot:
         self.next_sid = 1
         self.lock = threading.Lock()
         self._last_edit = {}  # (chat, message_id) -> time
+        self._flood_until = 0.0  # Telegram ne "ruko" kaha to tab tak edits band
         self._banner_id = None  # Telegram file_id (pehli baar bhejne ke baad cache)
         self._photos = set()  # (chat, message_id) jo photo+caption wale hain
 
@@ -1374,46 +1386,25 @@ class Bot:
         p = {"chat_id": chat, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": True}
         if markup:
             p["reply_markup"] = markup
-        try:
-            return self.api.call("sendMessage", p, timeout=15)["message_id"]
-        except TelegramError as e:
-            print("sendMessage failed:", e, file=sys.stderr)
-            return None
-
-    def send_photo(self, chat, text, markup=None):
-        """Banner photo + caption. Ye message baad me edit hoke progress aur phir EPUB file ban jata hai."""
-        p = {"chat_id": chat, "caption": text[:1000], "parse_mode": "HTML"}
-        try:
-            if self._banner_id:
-                if markup:
-                    p["reply_markup"] = markup
-                r = self.api.call("sendPhoto", dict(p, photo=self._banner_id), timeout=30)
-            elif BANNER.startswith(("http://", "https://")):
-                if markup:
-                    p["reply_markup"] = markup
-                r = self.api.call("sendPhoto", dict(p, photo=BANNER), timeout=30)
-            else:
-                if BANNER and os.path.isfile(BANNER):
-                    data, fname = Path(BANNER).read_bytes(), os.path.basename(BANNER)
-                else:
-                    data, fname = banner_png(), "banner.png"
-                if markup:
-                    p["reply_markup"] = json.dumps(markup)
-                mime = "image/png" if fname.lower().endswith(".png") else "image/jpeg"
-                r = self.api.call("sendPhoto", p, files={"photo": (fname, data, mime)}, timeout=60)
-            self._banner_id = r["photo"][-1]["file_id"]
-            self._photos.add((chat, r["message_id"]))
-            return r["message_id"]
-        except (TelegramError, OSError, KeyError) as e:
-            print("photo failed (text bhej raha hoon):", e, file=sys.stderr)
-            return None
+        for attempt in range(3):
+            try:
+                return self.api.call("sendMessage", p, timeout=15)["message_id"]
+            except TelegramError as e:
+                print("sendMessage failed:", e, file=sys.stderr)
+                if e.retry_after and attempt < 2:
+                    time.sleep(min(e.retry_after, 10) + 0.5)
+                    continue
+                return None
+            except Exception:  # noqa: BLE001
+                return None
+        return None
 
     def edit(self, chat, mid, text, markup=None, throttle=True):
         if mid is None:
             return
         key = (chat, mid)
         now = time.monotonic()
-        if throttle and now - self._last_edit.get(key, 0) < 3.0:
+        if throttle and (now < self._flood_until or now - self._last_edit.get(key, 0) < max(3.0, float(len(self.jobs)))):  # jobs zyada = edits dheere (flood se bachne ko)
             return
         self._last_edit[key] = now
         p = {"chat_id": chat, "message_id": mid, "parse_mode": "HTML"}
@@ -1425,18 +1416,22 @@ class Bot:
             else:
                 self.api.call("editMessageText", dict(p, text=text[:4000], disable_web_page_preview=True), timeout=15)
         except TelegramError as e:
-            if "no text" in str(e).lower():  # photo wala message (bot restart ke baad): caption edit karo
+            if e.retry_after:
+                self._flood_until = time.monotonic() + e.retry_after
+            elif "no text" in str(e).lower():  # photo wala message (bot restart ke baad): caption edit karo
                 self._photos.add(key)
                 try:
                     self.api.call("editMessageCaption", dict(p, caption=text[:1000]), timeout=15)
-                except TelegramError:
+                except Exception:  # noqa: BLE001
                     pass
+        except Exception:  # noqa: BLE001 (progress edit kabhi job ko nahi girana chahiye)
+            pass
 
     def answer(self, cq_id, text="", alert=False):
         try:
             self.api.call("answerCallbackQuery", {"callback_query_id": cq_id, "text": text[:190],
                                                   "show_alert": alert}, timeout=10)
-        except TelegramError:
+        except Exception:  # noqa: BLE001
             pass
 
     def stop(self):
@@ -1467,8 +1462,23 @@ class Bot:
     def welcome(self, chat, name="Friend", uid=0):
         """Naya /start message (banner ke saath). Baaki sab screens isi message me edit hoti hain."""
         text, markup = self.welcome_text(name, uid), menu_kb()
-        if self.send_photo(chat, text, markup) is None:
-            self.say(chat, text, markup)
+        if BANNER:
+            p = {"chat_id": chat, "caption": text, "parse_mode": "HTML", "reply_markup": markup}
+            try:
+                if self._banner_id:
+                    r = self.api.call("sendPhoto", dict(p, photo=self._banner_id), timeout=30)
+                elif os.path.isfile(BANNER):
+                    r = self.api.call("sendPhoto", dict(p, reply_markup=json.dumps(markup)),
+                                      files={"photo": (os.path.basename(BANNER), Path(BANNER).read_bytes(),
+                                                       "image/jpeg")}, timeout=60)
+                else:  # URL ya file_id
+                    r = self.api.call("sendPhoto", dict(p, photo=BANNER), timeout=30)
+                self._banner_id = r["photo"][-1]["file_id"]
+                self._photos.add((chat, r["message_id"]))
+                return
+            except (TelegramError, OSError, KeyError) as e:
+                print("banner failed (text bhej raha hoon):", e, file=sys.stderr)
+        self.say(chat, text, markup)
 
     def status_view(self, chat, uid):
         mine = sum(1 for j in self.jobs.values() if j.chat == chat)
@@ -1509,41 +1519,25 @@ class Bot:
             sess = Session(self.next_sid, chat, url)
             self.next_sid += 1
             self.sessions[sess.sid] = sess
-        text = card("🔍 Scanning…", "Chapter list dhoondh raha hoon", [cut(url, 60)])
-        markup = kb([btn("✖ Cancel", f"x:{sess.sid}", "danger")])
-        sess.mid = self.send_photo(chat, text, markup)
-        if sess.mid is None:
-            sess.mid = self.say(chat, text, markup)
+        sess.mid = self.say(chat, card("🔍 Scanning…", "Chapter list dhoondh raha hoon", [cut(url, 60)]),
+                            kb([btn("✖ Cancel", f"x:{sess.sid}", "danger")]))
         return sess
 
-    def scan_new(self, chat, url, preset, uid):
-        box = {}
-
-        def work():  # page download banner message bhejne ke saath-saath chalta hai
-            try:
-                check_public(url)
-                text = slim_html(decode(*fetch(url, prio=True)))
-                dom, info, refs = None, fast_info(text, url), fast_toc(text, url)
-                if len(refs) < MIN_TOC:  # fast tareeka fail -> purana (dheema par pakka) tareeka
-                    dom = parse_html(text)
-                    info = book_info(dom, url)
-                    refs = find_toc(dom, url)
-                box["r"] = (info, refs, dom)
-            except Exception as e:  # noqa: BLE001
-                box["e"] = e
-
-        t = threading.Thread(target=work, daemon=True)
-        t.start()
-        sess = self.new_session(chat, url)
-        t.join()
-        self.scan(sess, preset, uid, box)
-
-    def scan(self, sess, preset, uid, box):
+    def scan(self, sess, preset, uid):
         chat = sess.chat
         try:
-            if "e" in box:
-                raise box["e"]
-            info, refs, dom = box["r"]
+            check_public(sess.url)
+            dom = None
+            for att in range(3):  # kai links ek saath hon to pehla try fail ho sakta hai
+                try:
+                    dom = get_dom(sess.url, 6)
+                    break
+                except FetchError:
+                    if att == 2:
+                        raise
+                    time.sleep(2 + 2 * att + random.random())
+            info = book_info(dom, sess.url)
+            refs = find_toc(dom, sess.url)
         except (FetchError, ParseError) as e:
             self.drop_session(sess)
             self.edit(chat, sess.mid, card("❌ Failed", "Link scan nahi hua", [cut(str(e), 80)], foot="Sahi link bhejo"),
@@ -1564,6 +1558,14 @@ class Bot:
             sess.sel, sess.custom = "cust", tuple(pref["range"])
         elif pref.get("sel"):
             sess.sel = pref["sel"]
+        q = parse.parse_qs(parse.urlparse(sess.url).query)
+        if not preset and (q.get("page") or q.get("p")) and refs:
+            preset = (1, len(refs))  # ?page=N link = ek page ke chapters, seedha convert
+        elif not preset and pref.get("sel"):  # "Save as default" wali choice -> seedha convert
+            if sess.sel == "cust" and (not sess.custom or sess.custom[0] > (len(refs) or sess.custom[0])):
+                sess.sel = "all"
+            else:
+                preset = self.sel_range(sess)
         if preset:
             err = self.start_job(sess, uid, *preset)
             if err:
@@ -1604,9 +1606,9 @@ class Bot:
             return btn(("◉ " if on else "") + label, f"p:{sid}:{key}", "success" if on else None)
 
         def span(a, b):
-            return f"{a}–{b}" if b else f"{a}–end"
+            return f"{a:02d}-{b}" if b else f"{a:02d}-end"
 
-        row1 = [opt("all", "📚 Full novel" if total else "📚 All (slow)")]
+        row1 = [opt("all", "✂️ No cut" if total else "✂️ No cut (slow)")]
         row1 += [opt(k, span(a, min(b, total) if total else b)) for k, a, b in vis[:2]]
         row2 = [opt(k, span(a, min(b, total) if total else b)) for k, a, b in vis[2:]]
         row2.append(btn(f"◉ ✏️ {span(first, last)}", f"p:{sid}:c", "success") if sess.sel == "cust"
@@ -1615,7 +1617,7 @@ class Bot:
             quote = [f"📚 Chapters · {total}", f"✍️ Author · {cut(info['author'], 24)}",
                      f"🌐 Source · {cut(_host_key(sess.url), 24)}"]
             n = last - first + 1
-            pick = "Full novel" if (first, last) == (1, min(total, MAX_CHAPTERS)) else span(first, last)
+            pick = "No cut (all)" if (first, last) == (1, min(total, MAX_CHAPTERS)) else span(first, last)
             quote.append(f"🎯 Selected · {pick} ({n} chapters)")
         else:
             quote = ["⚠️ Chapter list nahi mili", "🐢 Next-link mode (slow)",
@@ -1623,7 +1625,7 @@ class Bot:
         foot = f"Max {MAX_CHAPTERS} chapters ek EPUB me" if total > MAX_CHAPTERS else "Create EPUB Book dabao 👇"
         self.edit(sess.chat, sess.mid, card(f"📖 {cut(info['title'], 40)}", "Range chuno, phir Create dabao",
                                             quote=quote, foot=foot),
-                  kb(row1, row2, [btn("📖 Create EPUB Book", f"p:{sid}:go", "success")],
+                  kb(row1, row2, [btn("Create EPUB Book", f"p:{sid}:go", "success")],
                      [btn("💾 Save as default", f"p:{sid}:sv", "primary"), btn("✖ Cancel", f"x:{sid}", "danger")]),
                   throttle=False)
 
@@ -1655,25 +1657,7 @@ class Bot:
                                           [f"⚙️ {phase}"], q), job_kb(job), throttle=throttle)
 
     def finish(self, job, head, sub, rows=(), quote=(), foot=None):
-        self.edit(job.chat, job.mid, card(head, sub, rows, quote, foot), kb([btn("🏠 Menu", "m:menu", "primary")]),
-                  throttle=False)
-
-    def deliver(self, job, cap, fname, data):
-        """EPUB usi progress message ki jagah aa jati hai (editMessageMedia). Na ho paye to naya document bhejo.
-        True = usi message me gayi."""
-        chat, mid = job.chat, job.mid
-        if mid is not None and (chat, mid) in self._photos:
-            media = {"type": "document", "media": "attach://book", "caption": cap[:1000], "parse_mode": "HTML"}
-            try:
-                self.api.call("editMessageMedia", {"chat_id": chat, "message_id": mid, "media": json.dumps(media)},
-                              files={"book": (fname, data, "application/epub+zip")}, timeout=300)
-                self._photos.discard((chat, mid))
-                return True
-            except TelegramError as e:
-                print("editMessageMedia failed (naya document bhej raha hoon):", e, file=sys.stderr)
-        self.api.call("sendDocument", {"chat_id": chat, "caption": cap, "parse_mode": "HTML"},
-                      files={"document": (fname, data, "application/epub+zip")}, timeout=300)
-        return False
+        self.edit(job.chat, job.mid, card(head, sub, rows, quote, foot), kb(), throttle=False)
 
     # ---- messages
     def handle(self, upd):
@@ -1701,6 +1685,10 @@ class Bot:
             return
         if cmd == "/help":
             self.say(chat, HELP_CARD, nav_kb())
+            return
+        if cmd == "/resetdefault":
+            prefs_save(uid, {})
+            self.say(chat, card("♻️ Default reset", "Ab har link par range screen aayegi"))
             return
         if cmd == "/status":
             self.say(chat, *self.status_view(chat, uid))
@@ -1750,7 +1738,8 @@ class Bot:
                     self.say(chat, card("⚠️ Range galat hai", None, [f"{first}-{last}", "Ye link chhod diya."]))
                     continue
                 preset = (first, last)
-            threading.Thread(target=self.scan_new, args=(chat, url, preset, uid), daemon=True).start()
+            sess = self.new_session(chat, url)
+            threading.Thread(target=self.scan, args=(sess, preset, uid), daemon=True).start()
 
     # ---- button presses
     def on_callback(self, cq):
@@ -1801,8 +1790,8 @@ class Bot:
             self.answer(cid, "Cancel ho gaya")
             if sess is not None and sess.chat == chat:
                 self.drop_session(sess)
-                self.edit(chat, sess.mid, card("🚫 Cancelled", None, ["Naya link bhej sakte ho."]),
-                          kb([btn("🏠 Menu", "m:menu", "primary")]), throttle=False)
+                self.edit(chat, sess.mid, card("🚫 Cancelled", None, ["Naya link bhej sakte ho."]), kb(),
+                          throttle=False)
         elif kind == "p":  # range pick
             sid, _, choice = rest.partition(":")
             sess = self.sessions.get(int(sid)) if sid.isdigit() else None
@@ -1857,7 +1846,11 @@ class Bot:
                 refs = refs[first - 1:(last or len(refs))][:MAX_CHAPTERS]
                 if not refs:
                     raise ParseError("Is range me koi chapter nahi hai")
-                info["label"] = range_label(refs, url, first, full_n)
+                q = parse.parse_qs(parse.urlparse(url).query)
+                if q.get("page") or q.get("p"):  # ?page=N link: page ke hisaab se asli numbers
+                    info["label"] = range_label(refs, url, first, full_n)
+                else:  # jo range chuni wahi naam me: 21-100 -> [ 21-100 ] (utne hi chapters)
+                    info["label"] = f"[ {first}-{first + len(refs) - 1} ]"
                 job.last = first + len(refs) - 1
                 chapters = self._download_all(refs, job)
             else:
@@ -1865,24 +1858,27 @@ class Bot:
             if not chapters:
                 raise ParseError("Koi chapter nahi mila. Chapter ya novel ka sahi link bhejo.")
             label = info.get("label") or f"[ {first}-{first + len(chapters) - 1} ]"
-            book_title = f"{label} {ascii_clean(info['title']) or info['title']}"
-            info["title"] = book_title
+            name = ascii_clean(info["title"]) or info["title"]
+            m = re.search(r"\d+", label)
+            base = int(m.group()) if m else first
             self.progress(job, "EPUB ban rahi hai", len(chapters), len(chapters), throttle=False)
-            out = pack_epub(info, chapters, tmp / "book.epub")
-            size = out.stat().st_size
-            if size > TG_LIMIT:
-                raise ParseError("EPUB 50 MB se badi hai. Chhoti range chuno, jaise 1-500")
+            parts = self._pack_parts(dict(info, title=f"{label} {name}"), name, label, chapters, base, tmp)
             bad = [c for c in chapters if not c.ok]
+            total_size = sum(x[3] for x in parts)
             summary = [f"📚 Chapters · {len(chapters)}" + (f" ({len(bad)} fail)" if bad else ""),
-                       f"💾 Size · {size / 1048576:.1f} MB"]
-            cap = card(f"📚 {cut(book_title, 60)}", f"Job #{job.jid}", quote=summary, foot="Happy reading 📖")
+                       f"💾 Size · {total_size / 1048576:.1f} MB" + (f" · {len(parts)} parts" if len(parts) > 1 else "")]
             self.progress(job, "Telegram par bhej raha hoon", len(chapters), len(chapters), throttle=False)
-            fname = tg_filename(safe_filename(book_title, 120)) + ".epub"
-            in_place = self.deliver(job, cap, fname, out.read_bytes())
+            for i, (path, title, cnt, size) in enumerate(parts, 1):
+                sub = f"Job #{job.jid}" + (f" · Part {i}/{len(parts)}" if len(parts) > 1 else "")
+                cap = card(f"📚 {cut(title, 60)}", sub, quote=[f"📚 Chapters · {cnt}", f"💾 Size · {size / 1048576:.1f} MB"],
+                           foot="Happy reading 📖")
+                self.upload(chat, path, tg_filename(safe_filename(title, 120)) + ".epub", cap)
             stats_add(job.uid)
-            if not in_place:  # file naye message me gayi, progress message ko "Completed" dikhao
-                self.finish(job, "✅ Completed", f"Job #{job.jid}", [f"📖 {cut(info['title'], 50)}"], summary,
-                            "EPUB upar bhej di gayi")
+            info["title"] = f"{label} {name}"
+            try:  # status card hata do, taaki EPUB seedha link ke neeche dikhe
+                self.api.call("deleteMessage", {"chat_id": chat, "message_id": job.mid}, timeout=10)
+            except Exception:  # noqa: BLE001
+                self.finish(job, "✅ Completed", f"Job #{job.jid}", [f"📖 {cut(info['title'], 50)}"], summary)
             if bad:
                 self.say(chat, card(f"⚠️ #{job.jid} · {len(bad)} chapters fail", "Site se nahi aaye",
                                     quote=[cut(c.title, 40) for c in bad[:20]], foot="Wahi range dobara bhejo"))
@@ -1901,6 +1897,45 @@ class Bot:
             self._last_edit.pop((chat, job.mid), None)
             with self.lock:
                 self.jobs.pop(job.jid, None)
+
+    def _pack_parts(self, info, name, label, chapters, base, tmp):
+        """EPUB banao. 49MB se badi ho to chapters barabar hisso me baant ke kai EPUB (har ek ka sahi [ a-b ] naam)."""
+        out = pack_epub(info, chapters, tmp / "book.epub")
+        size = out.stat().st_size
+        if size <= TG_LIMIT:
+            return [(out, info["title"], len(chapters), size)]
+        n = int(size / (TG_LIMIT * 0.85)) + 1
+        per = -(-len(chapters) // n)
+        res = []
+        for k in range(n):
+            sub = chapters[k * per:(k + 1) * per]
+            if not sub:
+                break
+            a = base + k * per
+            title = f"[ {a}-{a + len(sub) - 1} ] {name}"
+            path = pack_epub(dict(info, title=title), sub, tmp / f"part{k + 1}.epub")
+            sz = path.stat().st_size
+            if sz > TG_LIMIT:
+                raise ParseError("EPUB bahut badi hai. Chhoti range chuno, jaise 1-500")
+            res.append((path, title, len(sub), sz))
+        out.unlink(missing_ok=True)
+        return res
+
+    def upload(self, chat, path, fname, caption):
+        """EPUB bhejo: retry + flood wait. Ek saath max 3 uploads (bandwidth/RAM)."""
+        last = None
+        with _UPLOAD_SEM:
+            for attempt in range(4):
+                params = {"chat_id": chat, "caption": caption, "parse_mode": "HTML"}
+                if attempt >= 2:  # caption HTML ki wajah se reject ho to simple caption
+                    params = {"chat_id": chat, "caption": _TAG_STRIP.sub("", caption)[:1000]}
+                try:
+                    return self.api.upload("sendDocument", params, "document", path, fname, "application/epub+zip")
+                except TelegramError as e:
+                    last = e
+                    print("upload retry:", e, file=sys.stderr)
+                    time.sleep(min(e.retry_after, 30) + 1 if e.retry_after else 2 * (attempt + 1))
+        raise last
 
     def _run_batch(self, refs, idxs, results, tries, phase, job):
         """Daemon worker threads queue se chapters uthate hain."""
@@ -1923,8 +1958,7 @@ class Bot:
                 with lk:
                     done[0] += 1
 
-        n_thr = max(MIN_WORKERS * 2, min(WORKERS, TOTAL_WORKERS // max(len(self.jobs), 1)))
-        threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(n_thr, total))]
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(WORKERS, total))]
         for t in threads:
             t.start()
         while any(t.is_alive() for t in threads):
@@ -1939,16 +1973,18 @@ class Bot:
         lim = get_limiter(refs[0].url)
         job.total = n
         self._run_batch(refs, range(n), results, CH_TRIES, "Downloading", job)
+        mark_dupes(results)
         for p in range(1, REPAIR_PASSES + 1):  # fail wale chapters ko dheere dobara try karo
             if job.cancel.is_set():
                 break
             bad = [i for i, c in enumerate(results) if c is None or not c.ok]
             if not bad:
                 break
-            lim.cap(max(MIN_WORKERS, WORKERS * 3 // 4))
+            lim.cap(max(MIN_WORKERS, WORKERS // 2))
             self.progress(job, f"{len(bad)} fail, retry {p}/{REPAIR_PASSES}", n - len(bad), n, throttle=False)
-            time.sleep(1 * p)
+            time.sleep(2 * p)
             self._run_batch(refs, bad, results, CH_TRIES + 1, f"Retry round {p}", job)
+            mark_dupes(results)
         if job.cancel.is_set():
             raise Cancelled()
         return [c or _failed(refs[i].title, "pata nahi kyun") for i, c in enumerate(results)]
@@ -1984,7 +2020,6 @@ class Bot:
     # ---- main loop
     def run(self):
         me = self.api.call("getMe")
-        threading.Thread(target=banner_png, daemon=True).start()  # banner pehle se ready rakho
         try:
             self.api.call("deleteWebhook")
         except TelegramError:
@@ -1995,6 +2030,7 @@ class Bot:
                 {"command": "help", "description": "Guide dekho"},
                 {"command": "jobs", "description": "Chalte kaam dekho"},
                 {"command": "status", "description": "Bot status"},
+                {"command": "resetdefault", "description": "Saved default hatao"},
                 {"command": "cancel", "description": "Kaam rok do"},
                 {"command": "myid", "description": "Apna Telegram ID"}]})
         except TelegramError:
@@ -2031,53 +2067,10 @@ class Bot:
                     traceback.print_exc()
 
 
-# ============================== 8. RENDER FREE: health server + keep-alive ==============================
-class _Health(BaseHTTPRequestHandler):
-    def _ok(self, body=True):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", "2")
-        self.end_headers()
-        if body:
-            self.wfile.write(b"ok")
-
-    def do_GET(self):
-        self._ok()
-
-    def do_HEAD(self):
-        self._ok(False)
-
-    def log_message(self, *a):
-        pass
-
-
-def _keepalive(url):
-    """Render free 15 min bina traffic ke so jata hai. Har 10 min apne aap ko ping karo."""
-    while True:
-        time.sleep(600)
-        try:
-            request.urlopen(url, timeout=20).read()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def start_web():
-    port = os.environ.get("PORT")
-    if not port:
-        return
-    srv = ThreadingHTTPServer(("0.0.0.0", int(port)), _Health)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    url = os.environ.get("RENDER_EXTERNAL_URL")
-    if url:
-        threading.Thread(target=_keepalive, args=(url,), daemon=True).start()
-    print(f"Health server port {port} par chal raha hai.", flush=True)
-
-
 def main():
-    start_web()
     token = (os.environ.get("TELEGRAM_BOT_TOKEN") or BOT_TOKEN).strip()
     if not re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{10,}", token):
-        print("Bot token galat/khali hai. Render > Environment me TELEGRAM_BOT_TOKEN daalo.", file=sys.stderr)
+        print("Bot token galat hai (format 123456789:AA...). BOT_TOKEN me naya token daalo.", file=sys.stderr)
         return 2
     allowed = set(ALLOWED_USERS) | {int(x) for x in re.findall(r"\d+", os.environ.get("ALLOWED_USERS", ""))}
     if not allowed:
